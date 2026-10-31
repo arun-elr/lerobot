@@ -65,6 +65,7 @@ from ..common.flow_matching import (
     sample_time_beta,
 )
 from ..common.vla_utils import (
+    ReadOnlyPrefixCache,
     create_sinusoidal_pos_embedding,
     make_att_2d_masks,
     pad_vector,
@@ -162,30 +163,6 @@ def _reduce_training_rtc_loss(
 
 def _no_grad_if(enabled: bool):
     return torch.no_grad() if enabled else nullcontext()
-
-
-class _ReadOnlyPrefixCache:
-    """One chunk's prefix keys and values, shared by its denoise steps.
-
-    Each step's suffix attends to the prefix plus its own keys, as with a ``DynamicCache``, but
-    nothing is appended, so the steps need no per-step copy of the prefix. Implements the two
-    calls Gemma's attention and mask code make on a cache.
-    """
-
-    def __init__(self, kv: list[tuple[Tensor, Tensor]]):
-        self.kv = kv
-        self.prefix_len = kv[0][0].shape[-2]
-
-    @classmethod
-    def from_cache(cls, cache) -> "_ReadOnlyPrefixCache":
-        return cls([(keys, values) for keys, values, _ in cache])
-
-    def get_seq_length(self, layer_idx: int = 0) -> int:
-        return self.prefix_len
-
-    def update(self, key_states: Tensor, value_states: Tensor, layer_idx: int, cache_kwargs=None):
-        keys, values = self.kv[layer_idx]
-        return torch.cat([keys, key_states], dim=-2), torch.cat([values, value_states], dim=-2)
 
 
 def _joint_attention(
@@ -1057,7 +1034,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 return self.denoise_step(prefix_pad_masks, past_key_values, input_x_t, current_timestep)
 
         else:
-            prefix_cache = _ReadOnlyPrefixCache.from_cache(past_key_values)
+            prefix_cache = ReadOnlyPrefixCache.from_cache(past_key_values)
             suffix_attention = self._suffix_attention(prefix_pad_masks)
 
             def denoise(input_x_t, current_timestep):
@@ -1089,11 +1066,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep.
 
-        ``sample_actions`` passes a ``_ReadOnlyPrefixCache`` and the chunk's ``suffix_attention``;
+        ``sample_actions`` passes a ``ReadOnlyPrefixCache`` and the chunk's ``suffix_attention``;
         a caller that passes the prefill's ``DynamicCache`` and no mask gets the same result.
         """
-        if not isinstance(past_key_values, _ReadOnlyPrefixCache):
-            past_key_values = _ReadOnlyPrefixCache.from_cache(past_key_values)
+        if not isinstance(past_key_values, ReadOnlyPrefixCache):
+            past_key_values = ReadOnlyPrefixCache.from_cache(past_key_values)
         if suffix_attention is None:
             suffix_attention = self._suffix_attention(prefix_pad_masks)
         full_att_2d_masks_4d, position_ids = suffix_attention

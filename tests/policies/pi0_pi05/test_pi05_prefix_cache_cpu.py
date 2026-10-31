@@ -25,7 +25,7 @@ pytest.importorskip("transformers")
 
 from transformers import GemmaConfig, GemmaModel  # noqa: E402
 
-from lerobot.policies.pi05.modeling_pi05 import _ReadOnlyPrefixCache  # noqa: E402
+from lerobot.policies.common.vla_utils import ReadOnlyPrefixCache  # noqa: E402
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])
@@ -45,7 +45,7 @@ def test_prefix_cache_repeated_suffix_matches_cloned_dynamic_cache(batch_size):
     model = GemmaModel(config).eval()
     prefix = model(input_ids=torch.randint(0, 32, (batch_size, 5)), use_cache=True).past_key_values
     saved = [(layer.keys.clone(), layer.values.clone()) for layer in prefix.layers]
-    shared = _ReadOnlyPrefixCache.from_cache(prefix)
+    shared = ReadOnlyPrefixCache.from_cache(prefix)
     for _ in range(3):
         suffix = torch.randn(batch_size, 3, config.hidden_size)
         kwargs = {
