@@ -481,6 +481,10 @@ class ACT(nn.Module):
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
             for img in batch[OBS_IMAGES]:
+                if img.device.type == "cuda":
+                    # cuDNN runs these convolutions in NHWC; NCHW input costs a layout transpose
+                    # around every conv, forward and backward.
+                    img = img.contiguous(memory_format=torch.channels_last)
                 cam_features = self.backbone(img)["feature_map"]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
