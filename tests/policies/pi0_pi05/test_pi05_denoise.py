@@ -16,15 +16,21 @@
 
 """PI0.5's denoise loop: the shared read-only prefix cache and the CUDA-graph replay."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
+from torch import nn
 
 pytest.importorskip("transformers")
+
+from transformers import GemmaConfig  # noqa: E402
 
 from lerobot.policies.common.flow_matching import euler_integrate  # noqa: E402
 from lerobot.policies.common.vla_utils import clone_past_key_values, make_att_2d_masks  # noqa: E402
 from lerobot.policies.pi05 import PI05Config  # noqa: E402
-from lerobot.policies.pi05.modeling_pi05 import PI05Pytorch  # noqa: E402
+from lerobot.policies.pi05.modeling_pi05 import PaliGemmaWithExpertModel, PI05Pytorch  # noqa: E402
+from lerobot.policies.pi_gemma import PiGemmaForCausalLM, PiGemmaModel  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="PI0.5 at full size needs a GPU")
 
@@ -172,6 +178,90 @@ def test_a_subclass_with_its_own_denoise_step_keeps_its_contract(model):
     finally:
         sub.config.denoise_cuda_graph = False
         model.config.denoise_cuda_graph = False
+
+
+def _tiny_gemma(hidden_size, use_adarms=False):
+    # the towers share the attention layout (heads, one KV head, head size), only widths differ
+    config = GemmaConfig(
+        vocab_size=1024,
+        hidden_size=hidden_size,
+        intermediate_size=2 * hidden_size,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=8,
+        hidden_activation="gelu_pytorch_tanh",
+        use_adarms=use_adarms,
+        adarms_cond_dim=hidden_size if use_adarms else None,
+    )
+    config._attn_implementation = "eager"
+    return config
+
+
+class _TinyPaliGemmaWithExpert(PaliGemmaWithExpertModel):
+    """Two-layer Gemma towers, the expert's with AdaRMS, and a linear stand-in for SigLIP."""
+
+    def __init__(self, width, expert_width):
+        nn.Module.__init__(self)
+        self.freeze_vision_encoder = self.train_expert_only = False
+        self.paligemma = nn.Module()
+        self.paligemma.model = nn.Module()
+        self.paligemma.model.language_model = PiGemmaModel(_tiny_gemma(width))
+        self.gemma_expert = PiGemmaForCausalLM(_tiny_gemma(expert_width, use_adarms=True))
+        self.gemma_expert.model.embed_tokens = None
+        self.patch_proj = nn.Linear(3, width)
+
+    def embed_image(self, image):
+        pixels = image.flatten(2).transpose(1, 2).to(self.patch_proj.weight.dtype)
+        return self.patch_proj(pixels)  # one token per pixel
+
+
+class _TinyPI05(PI05Pytorch):
+    def __init__(self, width=32, expert_width=16):
+        nn.Module.__init__(self)
+        self.config = SimpleNamespace(
+            chunk_size=4,
+            max_action_dim=6,
+            num_inference_steps=3,
+            min_period=4e-3,
+            max_period=4.0,
+            image_resolution=(2, 2),
+            rtc_config=None,
+            denoise_cuda_graph=False,
+        )
+        self.rtc_processor = None
+        self.gradient_checkpointing_enabled = False
+        self.proprio_history_proj = None
+        self.paligemma_with_expert = _TinyPaliGemmaWithExpert(width, expert_width)
+        # bf16 towers with fp32 norms, as PI0.5 builds them; the projections below stay fp32
+        self.paligemma_with_expert.to_bfloat16_for_selected_params(torch.bfloat16)
+        self.action_in_proj = nn.Linear(6, expert_width)
+        self.action_out_proj = nn.Linear(expert_width, 6)
+        self.time_mlp_in = nn.Linear(expert_width, expert_width)
+        self.time_mlp_out = nn.Linear(expert_width, expert_width)
+
+
+@torch.no_grad()
+def test_a_graph_captured_under_autocast_reads_the_live_weights():
+    # With autocast's weight cache on, the capture would read the warmup's cached bf16 copies of
+    # the fp32 weights (freed when that autocast exits) instead of casting the live weights.
+    torch.manual_seed(0)
+    model = _TinyPI05().cuda().eval()
+    for p in model.parameters():
+        if not p.any():
+            p.normal_(std=0.02)  # the zero AdaRMS layers, as in _build
+    model.config.denoise_cuda_graph = True
+    kw = _inputs(model.config, batch_size=1, seed=9)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        model.sample_actions(**kw)  # captures
+    for p in model.parameters():
+        p.mul_(1.5)  # in place, as load_state_dict does
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        graphed = model.sample_actions(**kw)
+        model.config.denoise_cuda_graph = False
+        eager = model.sample_actions(**kw)
+    assert len(model._denoise_graphs) == 1
+    torch.testing.assert_close(graphed, eager, rtol=0, atol=1e-5)
 
 
 def test_the_cuda_graph_and_compile_model_are_alternatives():

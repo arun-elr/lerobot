@@ -203,10 +203,20 @@ class _DenoiseGraph:
         self.mask, self.position_ids = (t.clone() for t in suffix_attention)
         self.x_t, self.timestep = x_t.clone(), timestep.clone()
 
+        # Keep the caller's autocast but without its weight-cast cache: the casts made during warmup
+        # would be freed when the caller's autocast exits, while the graph still reads them.
+        autocast = torch.autocast(
+            "cuda",
+            dtype=torch.get_autocast_dtype("cuda"),
+            enabled=torch.is_autocast_enabled("cuda"),
+            cache_enabled=False,
+        )
+
         def step():
-            return model.denoise_step(
-                None, self.cache, self.x_t, self.timestep, (self.mask, self.position_ids)
-            )
+            with autocast:
+                return model.denoise_step(
+                    None, self.cache, self.x_t, self.timestep, (self.mask, self.position_ids)
+                )
 
         with torch.cuda.device(self.device):
             # warm up on a side stream before capture, as torch.cuda.graph requires
